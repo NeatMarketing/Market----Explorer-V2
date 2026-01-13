@@ -111,35 +111,15 @@ def _fmt_money(x: float, currency: str = "€") -> str:
     # French-ish grouping but without locale dependency
     return f"{currency}{x:,.0f}".replace(",", " ")
 
-
-def _seasonality_weights(peak_month: int, amplitude: float) -> list[float]:
-    """
-    Cosine-based monthly weights.
-    - peak_month: 1..12
-    - amplitude: 0..0.6 (reasonable)
-    Returns 12 positive weights summing to 1.
-    """
-    peak_idx = (peak_month - 1) % 12
-    vals = []
-    for m in range(12):
-        # cosine peak at m = peak_idx
-        angle = 2 * math.pi * (m - peak_idx) / 12
-        v = 1.0 + amplitude * math.cos(angle)
-        vals.append(max(0.05, v))  # avoid near-zero months
-    s = sum(vals)
-    return [v / s for v in vals]
-
-
 # =============================================================================
 # Header
 # =============================================================================
 st.title("🏨 Company Business Plan — Hotels")
 st.markdown(
-    '<div class="muted">From hotel revenue → estimate ADR → simulate insurance revenue, claims, and net income (with simple seasonality).</div>',
+    '<div class="muted">From hotel revenue → estimate stays → simulate insurance revenue, claims, and net income.</div>',
     unsafe_allow_html=True,
 )
 st.write("")
-
 
 # =============================================================================
 # Sidebar: scope + assumptions
@@ -164,9 +144,14 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("## Hotel inputs")
 
-    rooms = st.number_input("Number of rooms", min_value=1, max_value=20000, value=120, step=10)
-    occupancy = st.slider("Occupancy rate (assumption)", min_value=0.10, max_value=0.98, value=0.72, step=0.01)
-    avg_stay = st.slider("Average stay (nights)", min_value=1.0, max_value=14.0, value=2.4, step=0.1)
+    avg_revenue_per_stay = st.number_input(
+        "Average revenue per stay (€)",
+        min_value=10.0,
+        max_value=3000.0,
+        value=220.0,
+        step=10.0,
+        help="Use a typical total room revenue per booking (ADR × nights).",
+    )
 
     st.markdown("---")
     st.markdown("## Insurance assumptions")
@@ -179,22 +164,7 @@ with st.sidebar:
     avg_claim_cost = st.number_input("Average claim cost (€)", min_value=0.0, max_value=5000.0, value=220.0, step=10.0)
 
     st.markdown("---")
-    st.markdown("## Time / seasonality")
-
-    horizon_years = st.selectbox("Horizon", [1, 3, 5], index=0)
-    growth = st.slider("Hotel revenue growth (YoY)", min_value=-0.20, max_value=0.40, value=0.05, step=0.01)
-
-    seasonality_amp = st.slider("Seasonality amplitude", min_value=0.0, max_value=0.60, value=0.20, step=0.05)
-    peak_month = st.selectbox(
-        "Peak month",
-        list(range(1, 13)),
-        index=6,  # July
-        format_func=lambda m: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][m - 1],
-    )
-
-    st.markdown("---")
-    st.caption("Assumptions are intentionally simple for V1 (hotels only).")
-
+    st.caption("Assumptions are intentionally simple for V1 (annual view only).")
 
 # =============================================================================
 # Load hotel dataset (travel/hotel) and select company
@@ -254,17 +224,8 @@ hotel_rev_year_eur = rev_m * 1_000_000.0
 # =============================================================================
 # Core model (simple V1)
 # =============================================================================
-# Nights sold implied by revenue and ADR.
-# We estimate ADR from rooms, occupancy, and 365 days:
-# room_nights_capacity = rooms * 365
-# room_nights_sold = room_nights_capacity * occupancy
-# ADR = hotel_revenue / room_nights_sold
-room_nights_capacity = rooms * 365.0
-room_nights_sold = room_nights_capacity * occupancy if occupancy > 0 else 0.0
-adr = (hotel_rev_year_eur / room_nights_sold) if room_nights_sold > 0 else float("nan")
-
-# Number of stays (bookings) = room_nights_sold / avg_stay
-stays = (room_nights_sold / avg_stay) if avg_stay > 0 else 0.0
+# Stays implied by revenue and a single average revenue per stay assumption.
+stays = (hotel_rev_year_eur / avg_revenue_per_stay) if avg_revenue_per_stay > 0 else 0.0
 
 # Insurance business
 policies = stays * take_rate
@@ -279,13 +240,12 @@ attach_rate = take_rate
 # =============================================================================
 # KPIs header
 # =============================================================================
-k1, k2, k3, k4, k5 = st.columns(5)
+k1, k2, k3, k4 = st.columns(4)
 
 k1.metric("Hotel revenue (annual)", _fmt_money(hotel_rev_year_eur))
-k2.metric("Estimated ADR (€/night)", _fmt_money(adr, currency="€"))
-k3.metric("Room-nights sold", f"{room_nights_sold:,.0f}".replace(",", " "))
-k4.metric("Stays (annual)", f"{stays:,.0f}".replace(",", " "))
-k5.metric("Policies sold (annual)", f"{policies:,.0f}".replace(",", " "))
+k2.metric("Avg revenue per stay", _fmt_money(avg_revenue_per_stay, currency="€"))
+k3.metric("Stays (annual)", f"{stays:,.0f}".replace(",", " "))
+k4.metric("Policies sold (annual)", f"{policies:,.0f}".replace(",", " "))
 
 st.write("")
 
@@ -299,57 +259,19 @@ st.caption(f"Company: **{company}** ({country}) — Using **Revenue_M** as annua
 
 
 # =============================================================================
-# Build monthly + multi-year projection tables
+# Annual summary + chart
 # =============================================================================
-months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-weights = _seasonality_weights(peak_month=peak_month, amplitude=seasonality_amp)
-
-# Monthly (Year 1)
-df_month = pd.DataFrame(
-    {
-        "Month": months,
-        "Weight": weights,
-    }
-)
-df_month["HotelRevenue"] = hotel_rev_year_eur * df_month["Weight"]
-df_month["RoomNightsSold"] = room_nights_sold * df_month["Weight"]
-df_month["Stays"] = stays * df_month["Weight"]
-df_month["Policies"] = policies * df_month["Weight"]
-df_month["GrossInsuranceRevenue"] = gross_ins_rev * df_month["Weight"]
-df_month["Claims"] = claims * df_month["Weight"]
-df_month["NetInsuranceRevenue"] = net_ins_rev * df_month["Weight"]
-
-# Multi-year annual projection (simple growth on hotel revenue only; ADR & volume follow proportionally)
-years = list(range(1, horizon_years + 1))
-df_year = pd.DataFrame({"Year": years})
-df_year["HotelRevenue"] = [hotel_rev_year_eur * ((1 + growth) ** (y - 1)) for y in years]
-
-# Assume occupancy/rooms/avg_stay constant; so room-nights sold and stays scale with revenue via ADR (ADR constant here).
-# For V1: keep ADR fixed (from year1), scale volumes with revenue proportionally.
-rev_scale = df_year["HotelRevenue"] / hotel_rev_year_eur if hotel_rev_year_eur > 0 else 0.0
-df_year["RoomNightsSold"] = room_nights_sold * rev_scale
-df_year["Stays"] = stays * rev_scale
-df_year["Policies"] = df_year["Stays"] * attach_rate
-df_year["GrossInsuranceRevenue"] = df_year["Policies"] * insurance_price
-df_year["Claims"] = df_year["Policies"] * claim_rate * avg_claim_cost
-df_year["NetInsuranceRevenue"] = df_year["GrossInsuranceRevenue"] - df_year["Claims"]
-
-
-# =============================================================================
-# Charts
-# =============================================================================
-left, right = st.columns([1.2, 0.8], gap="large")
-
+left, right = st.columns([1.1, 0.9], gap="large")
 with left:
-    st.subheader("📈 Monthly insurance economics (Year 1)")
-    plot_month = df_month.melt(
-        id_vars=["Month"],
-        value_vars=["GrossInsuranceRevenue", "Claims", "NetInsuranceRevenue"],
-        var_name="Metric",
-        value_name="EUR",
+    st.subheader("📈 Annual insurance economics")
+    df_summary = pd.DataFrame(
+        {
+            "Metric": ["Gross insurance revenue", "Claims", "Net insurance revenue"],
+            "EUR": [gross_ins_rev, claims, net_ins_rev],
+        }
     )
-    fig1 = px.line(plot_month, x="Month", y="EUR", color="Metric", markers=True)
-    fig1.update_layout(height=420, legend_title_text="")
+    fig1 = px.bar(df_summary, x="Metric", y="EUR")
+    fig1.update_layout(height=360, xaxis_title="", yaxis_title="EUR")
     st.plotly_chart(fig1, use_container_width=True)
 
 with right:
@@ -358,53 +280,37 @@ with right:
         f"""
         <div class="card">
           <div class="pill">Hotel</div>
-          <div class="tiny"><b>Rooms</b>: {rooms}</div>
-          <div class="tiny"><b>Occupancy</b>: {occupancy*100:.1f}%</div>
-          <div class="tiny"><b>Avg stay</b>: {avg_stay:.1f} nights</div>
+          <div class="tiny"><b>Avg revenue / stay</b>: {_fmt_money(avg_revenue_per_stay, currency="€")}</div>
           <div style="height:10px;"></div>
           <div class="pill">Insurance</div>
           <div class="tiny"><b>Price / stay</b>: {_fmt_money(insurance_price, currency="€")}</div>
           <div class="tiny"><b>Take rate</b>: {take_rate*100:.1f}%</div>
           <div class="tiny"><b>Claim freq</b>: {claim_rate*100:.1f}%</div>
           <div class="tiny"><b>Avg claim</b>: {_fmt_money(avg_claim_cost, currency="€")}</div>
-          <div style="height:10px;"></div>
-          <div class="pill">Projection</div>
-          <div class="tiny"><b>Horizon</b>: {horizon_years} year(s)</div>
-          <div class="tiny"><b>YoY growth</b>: {growth*100:.1f}%</div>
-          <div class="tiny"><b>Seasonality</b>: amp {seasonality_amp:.2f}, peak {months[peak_month-1]}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 st.write("")
-st.subheader("📊 Annual projection")
-plot_year = df_year.melt(
-    id_vars=["Year"],
-    value_vars=["HotelRevenue", "GrossInsuranceRevenue", "Claims", "NetInsuranceRevenue"],
-    var_name="Metric",
-    value_name="EUR",
+st.subheader("🔎 Annual summary")
+summary_table = pd.DataFrame(
+    [
+        {
+            "HotelRevenue": round(hotel_rev_year_eur, 0),
+            "Stays": round(stays, 0),
+            "Policies": round(policies, 0),
+            "GrossInsuranceRevenue": round(gross_ins_rev, 0),
+            "Claims": round(claims, 0),
+            "NetInsuranceRevenue": round(net_ins_rev, 0),
+        }
+    ]
 )
-fig2 = px.bar(plot_year, x="Year", y="EUR", color="Metric", barmode="group")
-fig2.update_layout(height=420, legend_title_text="")
-st.plotly_chart(fig2, use_container_width=True)
-
-st.write("")
-st.subheader("🔎 Tables")
-t1, t2 = st.columns(2, gap="large")
-
-with t1:
-    st.markdown("**Monthly (Year 1)**")
-    show_month = df_month.copy()
-    for c in ["HotelRevenue", "GrossInsuranceRevenue", "Claims", "NetInsuranceRevenue"]:
-        show_month[c] = show_month[c].round(0)
-    st.dataframe(show_month[["Month", "HotelRevenue", "Stays", "Policies", "GrossInsuranceRevenue", "Claims", "NetInsuranceRevenue"]], use_container_width=True, hide_index=True)
-
-with t2:
-    st.markdown("**Annual projection**")
-    show_year = df_year.copy()
-    for c in ["HotelRevenue", "GrossInsuranceRevenue", "Claims", "NetInsuranceRevenue"]:
-        show_year[c] = show_year[c].round(0)
-    st.dataframe(show_year[["Year", "HotelRevenue", "Policies", "GrossInsuranceRevenue", "Claims", "NetInsuranceRevenue"]], use_container_width=True, hide_index=True)
-
-st.caption("V1 model: insurance priced per stay; volumes scale with hotel revenue using constant ADR assumption (simple).")
+st.dataframe(
+    summary_table[
+        ["HotelRevenue", "Stays", "Policies", "GrossInsuranceRevenue", "Claims", "NetInsuranceRevenue"]
+    ],
+    use_container_width=True,
+    hide_index=True,
+)
+st.caption("V1 model: insurance priced per stay; stays inferred from annual revenue and a single average revenue per stay assumption.")
